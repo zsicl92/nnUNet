@@ -18,11 +18,11 @@ def create_nonzero_mask(data):
     return binary_fill_holes(nonzero_mask)
 
 
-def crop_to_nonzero(data, seg=None, nonzero_label=-1):
+def crop_to_nonzero(data, seg=None, recon=None, nonzero_label=-1):
     """
-
     :param data:
     :param seg:
+    :param recon:
     :param nonzero_label: this will be written into the segmentation map
     :return:
     """
@@ -38,6 +38,10 @@ def crop_to_nonzero(data, seg=None, nonzero_label=-1):
         seg[(seg == 0) & (~nonzero_mask)] = nonzero_label
     else:
         seg = np.where(nonzero_mask, np.int8(0), np.int8(nonzero_label))
-    return data, seg, bbox
+    if recon is not None:
+        recon = recon[slicer]
+    else:
+        recon = np.where(nonzero_mask, np.float32(0), np.float32(nonzero_label))
+    return data, seg, recon, bbox
 
 

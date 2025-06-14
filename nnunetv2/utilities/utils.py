@@ -69,7 +69,11 @@ def get_filenames_of_train_images_and_targets(raw_dataset_folder: str, dataset_j
         identifiers = get_identifiers_from_splitted_dataset_folder(join(raw_dataset_folder, 'imagesTr'), dataset_json['file_ending'])
         images = create_lists_from_splitted_dataset_folder(join(raw_dataset_folder, 'imagesTr'), dataset_json['file_ending'], identifiers)
         segs = [join(raw_dataset_folder, 'labelsTr', i + dataset_json['file_ending']) for i in identifiers]
-        dataset = {i: {'images': im, 'label': se} for i, im, se in zip(identifiers, images, segs)}
+        if dataset_json['reconstruction']:
+            recons = [join(raw_dataset_folder, 'labelsTr', i + '_hd' + dataset_json['file_ending']) for i in identifiers]
+        else:
+            recons = [None for i in identifiers]
+        dataset = {i: {'images': im, 'label': se, 'recon': recon} for i, im, se, recon in zip(identifiers, images, segs, recons)}
     return dataset
 
 

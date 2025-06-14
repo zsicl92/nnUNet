@@ -37,7 +37,7 @@ class DefaultPreprocessor(object):
         Everything we need is in the plans. Those are given when run() is called
         """
 
-    def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], properties: dict,
+    def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], recon: Union[np.ndarray, None], properties: dict,
                      plans_manager: PlansManager, configuration_manager: ConfigurationManager,
                      dataset_json: Union[dict, str]):
         # let's not mess up the inputs!
@@ -45,6 +45,9 @@ class DefaultPreprocessor(object):
         if seg is not None:
             assert data.shape[1:] == seg.shape[1:], "Shape mismatch between image and segmentation. Please fix your dataset and make use of the --verify_dataset_integrity flag to ensure everything is correct"
             seg = np.copy(seg)
+        if recon is not None:
+            assert data.shape[1:] == recon.shape[1:], "Shape mismatch between image and reconstruction. Please fix your dataset and make use of the --verify_dataset_integrity flag to ensure everything is correct"
+            recon = np.copy(recon)
 
         has_seg = seg is not None
 
@@ -52,13 +55,15 @@ class DefaultPreprocessor(object):
         data = data.transpose([0, *[i + 1 for i in plans_manager.transpose_forward]])
         if seg is not None:
             seg = seg.transpose([0, *[i + 1 for i in plans_manager.transpose_forward]])
+        if recon is not None:
+            recon = recon.transpose([0, *[i + 1 for i in plans_manager.transpose_forward]])
         original_spacing = [properties['spacing'][i] for i in plans_manager.transpose_forward]
 
         # crop, remember to store size before cropping!
         shape_before_cropping = data.shape[1:]
         properties['shape_before_cropping'] = shape_before_cropping
         # this command will generate a segmentation. This is important because of the nonzero mask which we may need
-        data, seg, bbox = crop_to_nonzero(data, seg)
+        data, seg, recon, bbox = crop_to_nonzero(data, seg, recon)
         properties['bbox_used_for_cropping'] = bbox
         # print(data.shape, seg.shape)
         properties['shape_after_cropping_and_before_resampling'] = data.shape[1:]
@@ -75,13 +80,14 @@ class DefaultPreprocessor(object):
         # normalize
         # normalization MUST happen before resampling or we get huge problems with resampled nonzero masks no
         # longer fitting the images perfectly!
-        data = self._normalize(data, seg, configuration_manager,
+        data, recon = self._normalize(data, seg, recon, configuration_manager,
                                plans_manager.foreground_intensity_properties_per_channel)
 
         # print('current shape', data.shape[1:], 'current_spacing', original_spacing,
         #       '\ntarget shape', new_shape, 'target_spacing', target_spacing)
         old_shape = data.shape[1:]
         data = configuration_manager.resampling_fn_data(data, new_shape, original_spacing, target_spacing)
+        recon = configuration_manager.resampling_fn_data(recon, new_shape, original_spacing, target_spacing)
         seg = configuration_manager.resampling_fn_seg(seg, new_shape, original_spacing, target_spacing)
         if self.verbose:
             print(f'old shape: {old_shape}, new_shape: {new_shape}, old_spacing: {original_spacing}, '
@@ -110,9 +116,10 @@ class DefaultPreprocessor(object):
             seg = seg.astype(np.int16)
         else:
             seg = seg.astype(np.int8)
-        return data, seg
+        return data, seg, recon
 
-    def run_case(self, image_files: List[str], seg_file: Union[str, None], plans_manager: PlansManager,
+    def run_case(self, image_files: List[str], seg_file: Union[str, None], recon_file: Union[str, None], 
+                 plans_manager: PlansManager,
                  configuration_manager: ConfigurationManager,
                  dataset_json: Union[dict, str]):
         """
@@ -135,17 +142,23 @@ class DefaultPreprocessor(object):
             seg, _ = rw.read_seg(seg_file)
         else:
             seg = None
+        
+        # if possible, load recon
+        if recon_file is not None:
+            recon, _ = rw.read_seg(recon_file)
+        else:
+            recon = None
 
-        data, seg = self.run_case_npy(data, seg, data_properties, plans_manager, configuration_manager,
+        data, seg, recon = self.run_case_npy(data, seg, recon, data_properties, plans_manager, configuration_manager,
                                       dataset_json)
-        return data, seg, data_properties
+        return data, seg, recon, data_properties
 
-    def run_case_save(self, output_filename_truncated: str, image_files: List[str], seg_file: str,
+    def run_case_save(self, output_filename_truncated: str, image_files: List[str], seg_file: str, recon_file: str,
                       plans_manager: PlansManager, configuration_manager: ConfigurationManager,
                       dataset_json: Union[dict, str]):
-        data, seg, properties = self.run_case(image_files, seg_file, plans_manager, configuration_manager, dataset_json)
+        data, seg, recon, properties = self.run_case(image_files, seg_file, recon_file, plans_manager, configuration_manager, dataset_json)
         # print('dtypes', data.dtype, seg.dtype)
-        np.savez_compressed(output_filename_truncated + '.npz', data=data, seg=seg)
+        np.savez_compressed(output_filename_truncated + '.npz', data=data, seg=seg, recon=recon)
         write_pickle(properties, output_filename_truncated + '.pkl')
 
     @staticmethod
@@ -177,7 +190,7 @@ class DefaultPreprocessor(object):
                 print(c, target_num_samples)
         return class_locs
 
-    def _normalize(self, data: np.ndarray, seg: np.ndarray, configuration_manager: ConfigurationManager,
+    def _normalize(self, data: np.ndarray, seg: np.ndarray, recon: np.ndarray, configuration_manager: ConfigurationManager,
                    foreground_intensity_properties_per_channel: dict) -> np.ndarray:
         for c in range(data.shape[0]):
             scheme = configuration_manager.normalization_schemes[c]
@@ -189,7 +202,8 @@ class DefaultPreprocessor(object):
             normalizer = normalizer_class(use_mask_for_norm=configuration_manager.use_mask_for_norm[c],
                                           intensityproperties=foreground_intensity_properties_per_channel[str(c)])
             data[c] = normalizer.run(data[c], seg[0])
-        return data
+            recon[c] = normalizer.run(recon[c], seg[0])
+        return data, recon
 
     def run(self, dataset_name_or_id: Union[int, str], configuration_name: str, plans_identifier: str,
             num_processes: int):
@@ -238,7 +252,7 @@ class DefaultPreprocessor(object):
             for k in dataset.keys():
                 r.append(p.starmap_async(self.run_case_save,
                                          ((join(output_directory, k), dataset[k]['images'], dataset[k]['label'],
-                                           plans_manager, configuration_manager,
+                                           dataset[k]['recon'], plans_manager, configuration_manager,
                                            dataset_json),)))
 
             with tqdm(desc=None, total=len(dataset), disable=self.verbose) as pbar:

@@ -83,7 +83,7 @@ class nnUNetDataset(object):
             data = entry['open_data_file']
             # print('using open data file')
         elif isfile(entry['data_file'][:-4] + ".npy"):
-            data = np.load(entry['data_file'][:-4] + ".npy", 'r')
+            data = np.load(entry['data_file'][:-4] + ".npy", 'r+')
             if self.keep_files_open:
                 self.dataset[key]['open_data_file'] = data
                 # print('saving open data file')
@@ -94,7 +94,7 @@ class nnUNetDataset(object):
             seg = entry['open_seg_file']
             # print('using open data file')
         elif isfile(entry['data_file'][:-4] + "_seg.npy"):
-            seg = np.load(entry['data_file'][:-4] + "_seg.npy", 'r')
+            seg = np.load(entry['data_file'][:-4] + "_seg.npy", 'r+')
             if self.keep_files_open:
                 self.dataset[key]['open_seg_file'] = seg
                 # print('saving open seg file')
@@ -103,7 +103,7 @@ class nnUNetDataset(object):
 
         if 'seg_from_prev_stage_file' in entry.keys():
             if isfile(entry['seg_from_prev_stage_file'][:-4] + ".npy"):
-                seg_prev = np.load(entry['seg_from_prev_stage_file'][:-4] + ".npy", 'r')
+                seg_prev = np.load(entry['seg_from_prev_stage_file'][:-4] + ".npy", 'r+')
             else:
                 seg_prev = np.load(entry['seg_from_prev_stage_file'])['seg']
             seg = np.vstack((seg, seg_prev[None]))

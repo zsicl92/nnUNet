@@ -131,6 +131,11 @@ def verify_dataset_integrity(folder: str, num_processes: int = 8) -> None:
     if not 'dataset' in dataset_json.keys():
         assert isdir(join(folder, "imagesTr")), f"There needs to be a imagesTr subfolder in folder, folder={folder}"
         assert isdir(join(folder, "labelsTr")), f"There needs to be a labelsTr subfolder in folder, folder={folder}"
+    
+    if not 'segmentation' in dataset_json.keys():
+        dataset_json['segmentation'] = True
+    if not 'reconstruction' in dataset_json.keys():
+        dataset_json['reconstruction'] = False
 
     # make sure all required keys are there
     dataset_keys = list(dataset_json.keys())
@@ -179,13 +184,14 @@ def verify_dataset_integrity(folder: str, num_processes: int = 8) -> None:
         # old code that uses imagestr and labelstr folders
         labelfiles = subfiles(join(folder, 'labelsTr'), suffix=file_ending, join=False)
         label_identifiers = [i[:-len(file_ending)] for i in labelfiles]
-        labels_present = [i in label_identifiers for i in dataset.keys()]
+        labels_present = [(i in label_identifiers if not dataset_json['reconstruction'] else
+                           i in label_identifiers and i+'_hd' in label_identifiers) for i in dataset.keys()]
         missing = [i for j, i in enumerate(dataset.keys()) if not labels_present[j]]
         assert all(labels_present), f'not all training cases have a label file in labelsTr. Fix that. Missing: {missing}'
 
     labelfiles = [v['label'] for v in dataset.values()]
     image_files = [v['images'] for v in dataset.values()]
-
+    recon_files = [v['recon'] for v in dataset.values()]
     # no plans exist yet, so we can't use PlansManager and gotta roll with the default. It's unlikely to cause
     # problems anyway
     label_manager = LabelManager(dataset_json['labels'], regions_class_order=dataset_json.get('regions_class_order'))

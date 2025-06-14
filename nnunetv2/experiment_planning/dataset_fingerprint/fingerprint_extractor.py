@@ -39,13 +39,14 @@ class DatasetFingerprintExtractor(object):
         self.num_foreground_voxels_for_intensitystats = 10e7
 
     @staticmethod
-    def collect_foreground_intensities(segmentation: np.ndarray, images: np.ndarray, seed: int = 1234,
+    def collect_foreground_intensities(segmentation: np.ndarray, images: np.ndarray, recon: np.ndarray, seed: int = 1234,
                                        num_samples: int = 10000):
         """
         images=image with multiple channels = shape (c, x, y(, z))
         """
-        assert images.ndim == 4 and segmentation.ndim == 4
+        assert images.ndim == 4 and segmentation.ndim == 4 and recon.ndim == 4
         assert not np.any(np.isnan(segmentation)), "Segmentation contains NaN values. grrrr.... :-("
+        assert not np.any(np.isnan(recon)), "Reconstruction contains NaN values. grrrr.... :-("
         assert not np.any(np.isnan(images)), "Images contains NaN values. grrrr.... :-("
 
         rs = np.random.RandomState(seed)
@@ -87,21 +88,23 @@ class DatasetFingerprintExtractor(object):
         return intensities_per_channel, intensity_statistics_per_channel
 
     @staticmethod
-    def analyze_case(image_files: List[str], segmentation_file: str, reader_writer_class: Type[BaseReaderWriter],
+    def analyze_case(image_files: List[str], segmentation_file: str, reconstruction_file: str, 
+                     reader_writer_class: Type[BaseReaderWriter],
                      num_samples: int = 10000):
         rw = reader_writer_class()
         images, properties_images = rw.read_images(image_files)
         segmentation, properties_seg = rw.read_seg(segmentation_file)
+        reconstruction, properties_recon = rw.read_seg(reconstruction_file)
 
         # we no longer crop and save the cropped images before this is run. Instead we run the cropping on the fly.
         # Downside is that we need to do this twice (once here and once during preprocessing). Upside is that we don't
         # need to save the cropped data anymore. Given that cropping is not too expensive it makes sense to do it this
         # way. This is only possible because we are now using our new input/output interface.
-        data_cropped, seg_cropped, bbox = crop_to_nonzero(images, segmentation)
+        data_cropped, seg_cropped, recon_cropped, bbox = crop_to_nonzero(images, segmentation, reconstruction)
 
         foreground_intensities_per_channel, foreground_intensity_stats_per_channel = \
             DatasetFingerprintExtractor.collect_foreground_intensities(seg_cropped, data_cropped,
-                                                                       num_samples=num_samples)
+                                                                       recon_cropped, num_samples=num_samples)
 
         spacing = properties_images['spacing']
 
@@ -131,8 +134,8 @@ class DatasetFingerprintExtractor(object):
             with multiprocessing.get_context("spawn").Pool(self.num_processes) as p:
                 for k in self.dataset.keys():
                     r.append(p.starmap_async(DatasetFingerprintExtractor.analyze_case,
-                                             ((self.dataset[k]['images'], self.dataset[k]['label'], reader_writer_class,
-                                               num_foreground_samples_per_case),)))
+                                             ((self.dataset[k]['images'], self.dataset[k]['label'], self.dataset[k]['recon'], 
+                                               reader_writer_class, num_foreground_samples_per_case),)))
                 remaining = list(range(len(self.dataset)))
                 # p is pretty nifti. If we kill workers they just respawn but don't do any work.
                 # So we need to store the original pool of workers.
