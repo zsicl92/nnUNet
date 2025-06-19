@@ -11,6 +11,7 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
         selected_keys = self.get_indices()
         # preallocate memory for data and seg
         data_all = np.zeros(self.data_shape, dtype=np.float32)
+        recon_all = np.zeros(self.recon_shape, dtype=np.float32)
         seg_all = np.zeros(self.seg_shape, dtype=np.int16)
         case_properties = []
 
@@ -19,7 +20,7 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
             # (Lung for example)
             force_fg = self.get_do_oversample(j)
 
-            data, seg, properties = self._data.load_case(i)
+            data, seg, recon, properties = self._data.load_case(i)
             case_properties.append(properties)
 
             # If we are doing the cascade then the segmentation from the previous stage will already have been loaded by
@@ -41,6 +42,7 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
             # remove label -1 in the data augmentation but this way it is less error prone)
             this_slice = tuple([slice(0, data.shape[0])] + [slice(i, j) for i, j in zip(valid_bbox_lbs, valid_bbox_ubs)])
             data = data[this_slice]
+            recon = recon[this_slice]
 
             this_slice = tuple([slice(0, seg.shape[0])] + [slice(i, j) for i, j in zip(valid_bbox_lbs, valid_bbox_ubs)])
             seg = seg[this_slice]
@@ -48,29 +50,38 @@ class nnUNetDataLoader3D(nnUNetDataLoaderBase):
             padding = [(-min(0, bbox_lbs[i]), max(bbox_ubs[i] - shape[i], 0)) for i in range(dim)]
             padding = ((0, 0), *padding)
             data_all[j] = np.pad(data, padding, 'constant', constant_values=0)
+            recon_all[j] = np.pad(recon, padding, 'constant', constant_values=0)
             seg_all[j] = np.pad(seg, padding, 'constant', constant_values=-1)
 
         if self.transforms is not None:
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
                     data_all = torch.from_numpy(data_all).float()
+                    recon_all = torch.from_numpy(recon_all).float()
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
                     images = []
+                    recons = []
                     segs = []
                     for b in range(self.batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b], 'regression_target': recon_all[b]})
                         images.append(tmp['image'])
                         segs.append(tmp['segmentation'])
+                        recons.append(tmp['regression_target'])
                     data_all = torch.stack(images)
                     if isinstance(segs[0], list):
                         seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
                     else:
                         seg_all = torch.stack(segs)
-                    del segs, images
+                    
+                    if isinstance(recons[0], list):
+                        recon_all = [torch.stack([s[i] for s in recons]) for i in range(len(recons[0]))]
+                    else:
+                        recon_all = torch.stack(recons)
+                    del segs, images, recons
 
-            return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+            return {'data': data_all, 'target': seg_all, 'recon': recon_all, 'keys': selected_keys}
 
-        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+        return {'data': data_all, 'target': seg_all, 'recon': recon_all, 'keys': selected_keys}
 
 
 if __name__ == '__main__':

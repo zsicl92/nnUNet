@@ -18,10 +18,12 @@ class nnUNetDataLoaderBase(DataLoader):
                  sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  pad_sides: Union[List[int], Tuple[int, ...], np.ndarray] = None,
                  probabilistic_oversampling: bool = False,
-                 transforms=None):
+                 transforms=None,
+                 reconstruction: bool = False):
         super().__init__(data, batch_size, 1, None, True, False, True, sampling_probabilities)
         self.indices = list(data.keys())
-
+        
+        self.reconstruction = reconstruction
         self.oversample_foreground_percent = oversample_foreground_percent
         self.final_patch_size = final_patch_size
         self.patch_size = patch_size
@@ -35,7 +37,7 @@ class nnUNetDataLoaderBase(DataLoader):
             self.need_to_pad += pad_sides
         self.num_channels = None
         self.pad_sides = pad_sides
-        self.data_shape, self.seg_shape = self.determine_shapes()
+        self.data_shape, self.seg_shape, self.recon_shape = self.determine_shapes()
         self.sampling_probabilities = sampling_probabilities
         self.annotated_classes_key = tuple(label_manager.all_labels)
         self.has_ignore = label_manager.has_ignore_label
@@ -55,12 +57,13 @@ class nnUNetDataLoaderBase(DataLoader):
 
     def determine_shapes(self):
         # load one case
-        data, seg, properties = self._data.load_case(self.indices[0])
+        data, seg, recon, properties = self._data.load_case(self.indices[0])
         num_color_channels = data.shape[0]
 
         data_shape = (self.batch_size, num_color_channels, *self.patch_size)
         seg_shape = (self.batch_size, seg.shape[0], *self.patch_size)
-        return data_shape, seg_shape
+        recon_shape = (self.batch_size, recon.shape[0], *self.patch_size)
+        return data_shape, seg_shape, recon_shape
 
     def get_bbox(self, data_shape: np.ndarray, force_fg: bool, class_locations: Union[dict, None],
                  overwrite_class: Union[int, Tuple[int, ...]] = None, verbose: bool = False):

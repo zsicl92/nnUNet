@@ -3,6 +3,9 @@ from typing import Callable
 import torch
 from nnunetv2.utilities.ddp_allgather import AllGatherGrad
 from torch import nn
+import torch.nn.functional as F
+from typing import Union, List
+import torch.distributed as dist
 
 
 class SoftDiceLoss(nn.Module):
@@ -179,6 +182,156 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
 
     return tp, fp, fn, tn
 
+
+def ssim_tensor_safe(pred: Union[torch.Tensor, List[torch.Tensor]],
+                     target: Union[torch.Tensor, List[torch.Tensor]],
+                     window_size=11,
+                     C1=0.01**2,
+                     C2=0.03**2,
+                     eps=1e-8,
+                     reduction='mean',
+                     ddp: bool = False,
+                     layer_wise_weights: Union[List[float], None] = None):
+    """
+    SSIM for 2D/3D tensors or list of tensors. DDP-aware.
+    
+    Args:
+        pred, target: Tensor [B, 1, H, W] / [B, 1, D, H, W] or list of such tensors
+        reduction: 'mean' or 'none'
+        ddp: whether in distributed mode (DDP), uses all_reduce
+        layer_wise_weights: optional weights for each layer in list
+    Returns:
+        SSIM score (scalar if reduction='mean', tensor of shape [B] if 'none')
+    """
+    if not isinstance(pred, torch.Tensor):
+        pred = torch.from_numpy(pred)
+    if not isinstance(target, torch.Tensor):
+        target = torch.from_numpy(target)
+    if isinstance(pred, torch.Tensor):
+        pred = [pred]
+    if isinstance(target, torch.Tensor):
+        target = [target]
+
+    assert isinstance(pred, list) and isinstance(target, list)
+    assert len(pred) == len(target)
+    
+    if layer_wise_weights is None:
+        layer_wise_weights = [1.0 / len(pred)] * len(pred)
+    else:
+        assert len(layer_wise_weights) == len(pred), "Mismatch with number of prediction layers"
+        layer_wise_weights = torch.tensor(layer_wise_weights, device=pred[0].device)
+        layer_wise_weights = layer_wise_weights / layer_wise_weights.sum()  # normalize
+
+    ssim_all = []
+    for i, (p, t) in enumerate(zip(pred, target)):
+        assert p.shape == t.shape and p.ndim in [4, 5]
+
+        dims = [2, 3] if p.ndim == 4 else [2, 3, 4]
+        conv = F.conv2d if p.ndim == 4 else F.conv3d
+
+        channel = p.size(1)
+        kernel = torch.ones(1, 1, *([window_size] * len(dims)), device=p.device)
+        kernel = kernel / kernel.numel()
+        kernel = kernel.expand(channel, 1, *([-1] * len(dims)))
+
+        pad = window_size // 2
+        pad_shape = [pad] * len(dims) * 2
+        p = F.pad(p, pad_shape, mode='replicate')
+        t = F.pad(t, pad_shape, mode='replicate')
+
+        mu1 = conv(p, kernel, groups=channel)
+        mu2 = conv(t, kernel, groups=channel)
+
+        mu1_sq, mu2_sq = mu1 * mu1, mu2 * mu2
+        mu1_mu2 = mu1 * mu2
+        sigma1_sq = conv(p * p, kernel, groups=channel) - mu1_sq
+        sigma2_sq = conv(t * t, kernel, groups=channel) - mu2_sq
+        sigma12 = conv(p * t, kernel, groups=channel) - mu1_mu2
+
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+                   ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2) + eps)
+
+        ssim_val = ssim_map.mean(dim=dims)  # [B]
+        ssim_all.append(ssim_val * layer_wise_weights[i])
+
+    ssim_all = torch.stack(ssim_all, dim=0).sum(dim=0)  # shape: [B]
+
+    if ddp and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(ssim_all, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+        ssim_all = ssim_all / world_size
+
+    if reduction == 'mean':
+        return ssim_all.mean()
+    elif reduction == 'none':
+        return ssim_all
+    else:
+        raise ValueError("reduction must be 'mean' or 'none'")
+
+
+def psnr_tensor_flexible(preds: Union[torch.Tensor, List[torch.Tensor]],
+                         targets: Union[torch.Tensor, List[torch.Tensor]],
+                         data_range: Union[float, None] = None,
+                         eps: float = 1e-8,
+                         ddp: bool = False,
+                         reduction: str = 'mean',
+                         layer_wise_weights: Union[List[float], None] = None):
+    """
+    Computes PSNR over tensor or list of tensors (2D/3D), with optional DDP support.
+
+    Args:
+        preds: Tensor or list of [B, 1, H, W] or [B, 1, D, H, W]
+        targets: Same structure as preds
+        data_range: Range for normalization, if None, computed from each target
+        ddp: if True and DDP initialized, performs all_reduce
+        reduction: 'mean' (scalar) or 'none' (tensor per sample)
+        layer_wise_weights: optional weights for each pred-target pair
+
+    Returns:
+        PSNR value (scalar or tensor)
+    """
+    if isinstance(preds, torch.Tensor):
+        preds = [preds]
+    if isinstance(targets, torch.Tensor):
+        targets = [targets]
+
+    assert len(preds) == len(targets), "Mismatch in number of pred/target"
+
+    if layer_wise_weights is None:
+        layer_wise_weights = [1.0 / len(preds)] * len(preds)
+    else:
+        assert len(layer_wise_weights) == len(preds), "Mismatch in layer weights"
+        layer_wise_weights = torch.tensor(layer_wise_weights, device=preds[0].device)
+        layer_wise_weights = layer_wise_weights / layer_wise_weights.sum()
+
+    psnr_vals = []
+    for i, (pred, target) in enumerate(zip(preds, targets)):
+        pred = pred.float()
+        target = target.float()
+
+        if data_range is None:
+            range_val = (target.max() - target.min()).clamp(min=eps)
+        else:
+            range_val = torch.tensor(data_range, device=target.device)
+
+        mse = F.mse_loss(pred, target, reduction='mean')
+        mse = torch.clamp(mse, min=eps)
+        psnr = 10.0 * torch.log10(range_val ** 2 / mse)
+        psnr_vals.append(psnr * layer_wise_weights[i])
+
+    psnr_tensor = torch.stack(psnr_vals).sum()
+
+    if ddp and dist.is_available() and dist.is_initialized():
+        dist.all_reduce(psnr_tensor, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+        psnr_tensor = psnr_tensor / world_size
+
+    if reduction == 'mean':
+        return psnr_tensor
+    elif reduction == 'none':
+        return torch.stack(psnr_vals)
+    else:
+        raise ValueError("reduction must be 'mean' or 'none'")
 
 if __name__ == '__main__':
     from nnunetv2.utilities.helpers import softmax_helper_dim1

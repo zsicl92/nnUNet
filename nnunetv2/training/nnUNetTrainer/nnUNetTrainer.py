@@ -48,16 +48,17 @@ from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
-from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
+from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results, nnUNet_raw
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
 from nnunetv2.training.dataloading.data_loader_2d import nnUNetDataLoader2D
 from nnunetv2.training.dataloading.data_loader_3d import nnUNetDataLoader3D
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDataset
 from nnunetv2.training.dataloading.utils import get_case_identifiers, unpack_dataset
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
-from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
+from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss, SSIM_L1Loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
+from nnunetv2.training.loss.dice import ssim_tensor_safe, psnr_tensor_flexible
 from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
@@ -172,7 +173,7 @@ class nnUNetTrainer(object):
         self.log_file = join(self.output_folder, "training_log_%d_%d_%d_%02.0d_%02.0d_%02.0d.txt" %
                              (timestamp.year, timestamp.month, timestamp.day, timestamp.hour, timestamp.minute,
                               timestamp.second))
-        self.logger = nnUNetLogger()
+        self.logger = nnUNetLogger(reconstruction = self.dataset_json['reconstruction'])
 
         ### placeholders
         self.dataloader_train = self.dataloader_val = None  # see on_train_start
@@ -213,7 +214,8 @@ class nnUNetTrainer(object):
                 self.configuration_manager.network_arch_init_kwargs_req_import,
                 self.num_input_channels,
                 self.label_manager.num_segmentation_heads,
-                self.enable_deep_supervision
+                self.enable_deep_supervision,
+                self.dataset_json['reconstruction']
             ).to(self.device)
             # compile network for free speedup
             if self._do_i_compile():
@@ -227,6 +229,9 @@ class nnUNetTrainer(object):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
 
             self.loss = self._build_loss()
+            if self.dataset_json['reconstruction']:
+                self.recon_loss = SSIM_L1Loss(self.dataset_json['ssim_alpha'], 11, 
+                                              weights=self._get_deep_supervision_scales())
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
@@ -304,7 +309,8 @@ class nnUNetTrainer(object):
                                    arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
                                    num_input_channels: int,
                                    num_output_channels: int,
-                                   enable_deep_supervision: bool = True) -> nn.Module:
+                                   enable_deep_supervision: bool = True,
+                                   reconstruction: bool = False) -> nn.Module:
         """
         This is where you build the architecture according to the plans. There is no obligation to use
         get_network_from_plans, this is just a utility we use for the nnU-Net default architectures. You can do what
@@ -331,7 +337,8 @@ class nnUNetTrainer(object):
             num_input_channels,
             num_output_channels,
             allow_init=True,
-            deep_supervision=enable_deep_supervision)
+            deep_supervision=enable_deep_supervision,
+            reconstruction=reconstruction)
 
     def _get_deep_supervision_scales(self):
         if self.enable_deep_supervision:
@@ -917,7 +924,8 @@ class nnUNetTrainer(object):
         if self.unpack_dataset and self.local_rank == 0:
             self.print_to_log_file('unpacking dataset...')
             unpack_dataset(self.preprocessed_dataset_folder, unpack_segmentation=True, overwrite_existing=False,
-                           num_processes=max(1, round(get_allowed_n_proc_DA() // 2)), verify_npy=True)
+                           num_processes=max(1, round(get_allowed_n_proc_DA() // 2)), verify_npy=True,
+                           unpack_reconstruction=self.dataset_json['reconstruction'])
             self.print_to_log_file('unpacking done...')
 
         if self.is_ddp:
@@ -978,12 +986,17 @@ class nnUNetTrainer(object):
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
+        recon = batch['recon']
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
+        if isinstance(recon, list):
+            recon = [i.to(self.device, non_blocking=True) for i in recon]
+        else:
+            recon = recon.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
@@ -993,7 +1006,12 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             # del data
-            l = self.loss(output, target)
+            if self.dataset_json['reconstruction']:
+                seg_loss = self.loss(output[0], target)
+                recon_loss = self.recon_loss(output[1], recon)
+                l = self.dataset_json['lambda_seg'] * seg_loss + self.dataset_json['lambda_recon'] * recon_loss
+            else:
+                l = self.loss(output, target)
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -1005,7 +1023,12 @@ class nnUNetTrainer(object):
             l.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        return {'loss': l.detach().cpu().numpy()}
+        if self.dataset_json['reconstruction']:
+            return {'loss': l.detach().cpu().numpy(), 
+                    'recon_loss': recon_loss.detach().cpu().numpy(),
+                    'seg_loss': seg_loss.detach().cpu().numpy()}
+        else:
+            return {'loss': l.detach().cpu().numpy()}
 
     def on_train_epoch_end(self, train_outputs: List[dict]):
         outputs = collate_outputs(train_outputs)
@@ -1018,19 +1041,63 @@ class nnUNetTrainer(object):
             loss_here = np.mean(outputs['loss'])
 
         self.logger.log('train_losses', loss_here, self.current_epoch)
+        
+        if self.dataset_json['reconstruction']:
+            if self.is_ddp:
+                losses_tr_seg = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(losses_tr_seg, outputs['seg_loss'])
+                loss_seg_here = np.vstack(losses_tr_seg).mean()
+                losses_tr_recon = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(losses_tr_recon, outputs['recon_loss'])
+                loss_recon_here = np.vstack(losses_tr_recon).mean()
+            else:
+                loss_seg_here = np.mean(outputs['seg_loss'])
+                loss_recon_here = np.mean(outputs['recon_loss'])
+
+            self.logger.log('train_seg_losses', loss_seg_here, self.current_epoch)
+            self.logger.log('train_recon_losses', loss_recon_here, self.current_epoch)
 
     def on_validation_epoch_start(self):
         self.network.eval()
 
+    def denormalize(self, normalized_image, intensity_properties: dict):
+        """
+        Reverses the CT normalization process using the original intensity statistics.
+
+        normalized_image : np.ndarray or tensor
+        intensity_properties : dict
+            Expected keys:
+                - 'mean': mean intensity of the original image
+                - 'std': standard deviation of intensity
+                - 'percentile_00_5': lower clipping bound (float)
+                - 'percentile_99_5': upper clipping bound (float)
+        return: The image restored to its original intensity scale (approximately).
+        """
+        mean = intensity_properties['mean']
+        std = intensity_properties['std']
+        lower = intensity_properties['percentile_00_5']
+        upper = intensity_properties['percentile_99_5']
+        image = normalized_image * max(std, 1e-8) + mean
+        # Optionally, clip back to the original bounds (not strictly necessary)
+        # image = np.clip(image, lower, upper)
+        image = torch.clamp(image, min=lower, max=upper)
+
+        return image
+
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
+        recon = batch['recon']
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
             target = [i.to(self.device, non_blocking=True) for i in target]
         else:
             target = target.to(self.device, non_blocking=True)
+        if isinstance(recon, list):
+            recon = [i.to(self.device, non_blocking=True) for i in recon]
+        else:
+            recon = recon.to(self.device, non_blocking=True)
 
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
@@ -1039,12 +1106,27 @@ class nnUNetTrainer(object):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data)
             del data
-            l = self.loss(output, target)
+            if self.dataset_json['reconstruction']:
+                seg_loss = self.loss(output[0], target)
+                recon_loss = self.recon_loss(output[1], recon)
+                l = self.dataset_json['lambda_seg'] * seg_loss + self.dataset_json['lambda_recon'] * recon_loss
+            else:
+                l = self.loss(output, target)
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
-            output = output[0]
+            output = output[0][0] if self.dataset_json['reconstruction'] else output[0]
             target = target[0]
+            if self.dataset_json['reconstruction']:
+                recon_pred = output[1][0]
+                recon = recon[0]
+        if self.dataset_json['reconstruction']:
+            recon_pred = output[1]
+            CT_properties = self.plans_manager.foreground_intensity_properties_per_channel['0'] # 0: CT
+            recon_pred = self.denormalize(recon_pred, CT_properties)
+            recon = self.denormalize(recon, CT_properties)
+            ssim_score = ssim_tensor_safe(recon_pred, recon)
+            psnr_score = psnr_tensor_flexible(recon_pred, recon)
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -1086,9 +1168,13 @@ class nnUNetTrainer(object):
             tp_hard = tp_hard[1:]
             fp_hard = fp_hard[1:]
             fn_hard = fn_hard[1:]
-
-        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
-
+        if self.dataset_json['reconstruction']:
+            return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard,
+                    'recon_loss': recon_loss.detach().cpu().numpy(), 'seg_loss': seg_loss.detach().cpu().numpy(),
+                    'ssim_score': ssim_score.detach().cpu().numpy(), 'psnr_score': psnr_score.detach().cpu().numpy()}
+        else:
+            return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+    
     def on_validation_epoch_end(self, val_outputs: List[dict]):
         outputs_collated = collate_outputs(val_outputs)
         tp = np.sum(outputs_collated['tp_hard'], 0)
@@ -1113,14 +1199,43 @@ class nnUNetTrainer(object):
             losses_val = [None for _ in range(world_size)]
             dist.all_gather_object(losses_val, outputs_collated['loss'])
             loss_here = np.vstack(losses_val).mean()
+            
+            if self.dataset_json['reconstruction']:
+                ssims_val = [None for _ in range(world_size)]
+                dist.all_gather_object(ssims_val, outputs_collated['ssim_score'])
+                ssim_here = np.vstack(ssims_val).mean()
+                
+                psnrs_val = [None for _ in range(world_size)]
+                dist.all_gather_object(psnrs_val, outputs_collated['psnr_score'])
+                psnr_here = np.vstack(psnrs_val).mean()
+                
+                val_seg_losses = [None for _ in range(world_size)]
+                dist.all_gather_object(val_seg_losses, outputs_collated['seg_loss'])
+                val_seg_here = np.vstack(val_seg_losses).mean()
+                
+                val_recon_losses = [None for _ in range(world_size)]
+                dist.all_gather_object(val_recon_losses, outputs_collated['recon_loss'])
+                val_recon_here = np.vstack(val_recon_losses).mean()
         else:
             loss_here = np.mean(outputs_collated['loss'])
+            if self.dataset_json['reconstruction']:
+                ssim_here = np.mean(outputs_collated['ssim_score'])
+                psnr_here = np.mean(outputs_collated['psnr_score'])
+                val_seg_here = np.mean(outputs_collated['seg_loss'])
+                val_recon_here = np.mean(outputs_collated['recon_loss'])
 
         global_dc_per_class = [i for i in [2 * i / (2 * i + j + k) for i, j, k in zip(tp, fp, fn)]]
         mean_fg_dice = np.nanmean(global_dc_per_class)
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
+        if self.dataset_json['reconstruction']:
+            self.logger.log('val_seg_losses', val_seg_here, self.current_epoch)
+            self.logger.log('val_recon_losses', val_recon_here, self.current_epoch)
+            self.logger.log('mean_ssim', ssim_here, self.current_epoch)
+            self.logger.log('mean_psnr', psnr_here, self.current_epoch)
+            self.logger.log('mean_union', ssim_here * self.dataset_json['lambda_recon'] + \
+                mean_fg_dice * self.dataset_json['lambda_seg'], self.current_epoch)
 
     def on_epoch_start(self):
         self.logger.log('epoch_start_timestamps', time(), self.current_epoch)
@@ -1134,6 +1249,14 @@ class nnUNetTrainer(object):
                                                self.logger.my_fantastic_logging['dice_per_class_or_region'][-1]])
         self.print_to_log_file(
             f"Epoch time: {np.round(self.logger.my_fantastic_logging['epoch_end_timestamps'][-1] - self.logger.my_fantastic_logging['epoch_start_timestamps'][-1], decimals=2)} s")
+        if self.dataset_json['reconstruction']:
+            self.print_to_log_file('train_seg_losses', np.round(self.logger.my_fantastic_logging['train_seg_losses'][-1], decimals=4))
+            self.print_to_log_file('train_recon_losses', np.round(self.logger.my_fantastic_logging['train_recon_losses'][-1], decimals=4))
+            self.print_to_log_file('val_seg_losses', np.round(self.logger.my_fantastic_logging['val_seg_losses'][-1], decimals=4))
+            self.print_to_log_file('val_recon_losses', np.round(self.logger.my_fantastic_logging['val_recon_losses'][-1], decimals=4))
+            self.print_to_log_file('ema_union', np.round(self.logger.my_fantastic_logging['ema_union'][-1], decimals=4))
+            self.print_to_log_file('ema_ssim', np.round(self.logger.my_fantastic_logging['ema_ssim'][-1], decimals=4))
+            self.print_to_log_file('ema_psnr', np.round(self.logger.my_fantastic_logging['ema_psnr'][-1], decimals=4))
 
         # handling periodic checkpointing
         current_epoch = self.current_epoch
@@ -1141,10 +1264,17 @@ class nnUNetTrainer(object):
             self.save_checkpoint(join(self.output_folder, 'checkpoint_latest.pth'))
 
         # handle 'best' checkpointing. ema_fg_dice is computed by the logger and can be accessed like this
-        if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
-            self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
-            self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
-            self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+        if self.dataset_json['reconstruction']:
+            if self._best_ema is None or self.logger.my_fantastic_logging['ema_union'][-1] > self._best_ema:
+                self._best_ema = self.logger.my_fantastic_logging['ema_union'][-1]
+                self.print_to_log_file(
+                    f"Yayy! New best EMA pseudo Union of Dice and SSIM: {np.round(self._best_ema, decimals=4)}")
+                self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
+        else:
+            if self._best_ema is None or self.logger.my_fantastic_logging['ema_fg_dice'][-1] > self._best_ema:
+                self._best_ema = self.logger.my_fantastic_logging['ema_fg_dice'][-1]
+                self.print_to_log_file(f"Yayy! New best EMA pseudo Dice: {np.round(self._best_ema, decimals=4)}")
+                self.save_checkpoint(join(self.output_folder, 'checkpoint_best.pth'))
 
         if self.local_rank == 0:
             self.logger.plot_progress_png(self.output_folder)
@@ -1260,6 +1390,7 @@ class nnUNetTrainer(object):
                 _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
 
             results = []
+            CT_properties = self.plans_manager.foreground_intensity_properties_per_channel['0'] # 0: CT
 
             for i, k in enumerate(dataset_val.keys()):
                 proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
@@ -1270,7 +1401,7 @@ class nnUNetTrainer(object):
                                                                allowed_num_queued=2)
 
                 self.print_to_log_file(f"predicting {k}")
-                data, seg, properties = dataset_val.load_case(k)
+                data, seg, recon, properties = dataset_val.load_case(k)
 
                 if self.is_cascaded:
                     data = np.vstack((data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
@@ -1283,7 +1414,12 @@ class nnUNetTrainer(object):
                 self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
                 output_filename_truncated = join(validation_output_folder, k)
 
-                prediction = predictor.predict_sliding_window_return_logits(data)
+                reconstruction = None
+                if self.dataset_json['reconstruction']:
+                    prediction, reconstruction = predictor.predict_sliding_window_return_logits(data)
+                    reconstruction = self.denormalize(reconstruction, CT_properties).cpu()
+                else:
+                    prediction = predictor.predict_sliding_window_return_logits(data)
                 prediction = prediction.cpu()
 
                 # this needs to go into background processes
@@ -1291,7 +1427,8 @@ class nnUNetTrainer(object):
                     segmentation_export_pool.starmap_async(
                         export_prediction_from_logits, (
                             (prediction, properties, self.configuration_manager, self.plans_manager,
-                             self.dataset_json, output_filename_truncated, save_probabilities),
+                             self.dataset_json, output_filename_truncated, save_probabilities,
+                             reconstruction),
                         )
                     )
                 )
@@ -1310,7 +1447,10 @@ class nnUNetTrainer(object):
                             # we do this so that we can use load_case and do not have to hard code how loading training cases is implemented
                             tmp = nnUNetDataset(expected_preprocessed_folder, [k],
                                                 num_images_properties_loading_threshold=0)
-                            d, s, p = tmp.load_case(k)
+                            if self.dataset_json['reconstruction']:
+                                d, s, _, p = tmp.load_case(k)
+                            else:
+                                d, s, p = tmp.load_case(k)
                         except FileNotFoundError:
                             self.print_to_log_file(
                                 f"Predicting next stage {n} failed for case {k} because the preprocessed file is missing! "
@@ -1350,10 +1490,19 @@ class nnUNetTrainer(object):
                                                 self.label_manager.foreground_labels,
                                                 self.label_manager.ignore_label, chill=True,
                                                 num_processes=default_num_processes * dist.get_world_size() if
-                                                self.is_ddp else default_num_processes)
+                                                self.is_ddp else default_num_processes, 
+                                                dataset_json=self.dataset_json,
+                                                intensity_properties=CT_properties,
+                                                folder_recon_ref=join(nnUNet_raw, self.plans_manager.dataset_name, 'labelsTr'))
             self.print_to_log_file("Validation complete", also_print_to_console=True)
             self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
                                    also_print_to_console=True)
+            if self.dataset_json['reconstruction']:
+                self.print_to_log_file("Mean Validation SSIM: ", (metrics['mean_ssim']),
+                                    also_print_to_console=True)
+                self.print_to_log_file("Mean Validation Union: ", (metrics['mean_ssim'] * self.dataset_json['lambda_recon']+\
+                    metrics['foreground_mean']["Dice"] * self.dataset_json['lambda_seg']),
+                                    also_print_to_console=True)
 
         self.set_deep_supervision_enabled(True)
         compute_gaussian.cache_clear()

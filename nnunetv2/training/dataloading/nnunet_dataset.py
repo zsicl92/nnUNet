@@ -100,6 +100,17 @@ class nnUNetDataset(object):
                 # print('saving open seg file')
         else:
             seg = np.load(entry['data_file'])['seg']
+        
+        if 'open_recon_file' in entry.keys():
+            recon = entry['open_recon_file']
+            # print('using open data file')
+        elif isfile(entry['data_file'][:-4] + "_recon.npy"):
+            recon = np.load(entry['data_file'][:-4] + "_recon.npy", 'r+')
+            if self.keep_files_open:
+                self.dataset[key]['open_recon_file'] = recon
+                # print('saving open recon file')
+        else:
+            recon = np.load(entry['data_file'])['recon']
 
         if 'seg_from_prev_stage_file' in entry.keys():
             if isfile(entry['seg_from_prev_stage_file'][:-4] + ".npy"):
@@ -108,7 +119,7 @@ class nnUNetDataset(object):
                 seg_prev = np.load(entry['seg_from_prev_stage_file'])['seg']
             seg = np.vstack((seg, seg_prev[None]))
 
-        return data, seg, entry['properties']
+        return data, seg, recon, entry['properties']
 
 
 if __name__ == '__main__':

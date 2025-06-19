@@ -540,7 +540,10 @@ class nnUNetPredictor(object):
 
     def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
         mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
-        prediction = self.network(x)
+        if self.dataset_json['reconstruction']:
+            prediction, reconstruction = self.network(x)
+        else:
+            prediction = self.network(x)
 
         if mirror_axes is not None:
             # check for invalid numbers in mirror_axes
@@ -552,16 +555,27 @@ class nnUNetPredictor(object):
                 c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
             ]
             for axes in axes_combinations:
-                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+                if self.dataset_json['reconstruction']:
+                    prediction_, reconstruction_ = self.network(torch.flip(x, axes))
+                    prediction += torch.flip(prediction_, axes)
+                    reconstruction += torch.flip(reconstruction_, axes)
+                else:
+                    prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
             prediction /= (len(axes_combinations) + 1)
-        return prediction
+            if self.dataset_json['reconstruction']:
+                reconstruction /= (len(axes_combinations) + 1)
+        
+        if self.dataset_json['reconstruction']:
+            return prediction, reconstruction
+        else:
+            return prediction
 
     def _internal_predict_sliding_window_return_logits(self,
                                                        data: torch.Tensor,
                                                        slicers,
                                                        do_on_device: bool = True,
                                                        ):
-        predicted_logits = n_predictions = prediction = gaussian = workon = None
+        predicted_logits = n_predictions = prediction = gaussian = workon = reconstruction = None
         results_device = self.device if do_on_device else torch.device('cpu')
 
         try:
@@ -578,6 +592,9 @@ class nnUNetPredictor(object):
             predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
                                            dtype=torch.half,
                                            device=results_device)
+            if self.dataset_json['reconstruction']:
+                reconstruction_preds = torch.zeros(data.shape, dtype=data.dtype, device=results_device)
+            
             n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
 
             if self.use_gaussian:
@@ -592,26 +609,43 @@ class nnUNetPredictor(object):
             for sl in tqdm(slicers, disable=not self.allow_tqdm):
                 workon = data[sl][None]
                 workon = workon.to(self.device)
-
-                prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+                if self.dataset_json['reconstruction']:
+                    prediction, reconstruction = self._internal_maybe_mirror_and_predict(workon)
+                    prediction = prediction[0].to(results_device) # squeeze batch size
+                    reconstruction = reconstruction[0].to(results_device)
+                else:
+                    prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
 
                 if self.use_gaussian:
                     prediction *= gaussian
                 predicted_logits[sl] += prediction
                 n_predictions[sl[1:]] += gaussian
+                if self.dataset_json['reconstruction']:
+                    if self.use_gaussian:
+                        reconstruction *= gaussian
+                    reconstruction_preds[sl] += reconstruction
 
             predicted_logits /= n_predictions
+            if self.dataset_json['reconstruction']:
+                reconstruction_preds /= n_predictions
             # check for infs
-            if torch.any(torch.isinf(predicted_logits)):
+            inf_flags = torch.isinf(predicted_logits) & torch.isinf(reconstruction_preds) \
+                if self.dataset_json['reconstruction'] else torch.isinf(predicted_logits)
+            if torch.any(inf_flags):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
                                    'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
                                    'predicted_logits to fp32')
         except Exception as e:
             del predicted_logits, n_predictions, prediction, gaussian, workon
+            if self.dataset_json['reconstruction']:
+                del reconstruction_preds, reconstruction
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
-        return predicted_logits
+        if self.dataset_json['reconstruction']:
+            return predicted_logits, reconstruction_preds
+        else:
+            return predicted_logits
 
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
             -> Union[np.ndarray, torch.Tensor]:
@@ -646,21 +680,37 @@ class nnUNetPredictor(object):
                 if self.perform_everything_on_device and self.device != 'cpu':
                     # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                     try:
-                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                        if self.dataset_json['reconstruction']:
+                            predicted_logits, reconstruction_preds = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                               self.perform_everything_on_device)
+                        else:
+                            predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                                                                self.perform_everything_on_device)
                     except RuntimeError:
                         print(
                             'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
                         empty_cache(self.device)
-                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                        if self.dataset_json['reconstruction']:
+                            predicted_logits, reconstruction_preds = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                        else:
+                            predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
                 else:
-                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                    if self.dataset_json['reconstruction']:
+                        predicted_logits, reconstruction_preds = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                           self.perform_everything_on_device)
+                    else:
+                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
                                                                                            self.perform_everything_on_device)
 
                 empty_cache(self.device)
                 # revert padding
                 predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
-        return predicted_logits
+                if self.dataset_json['reconstruction']:
+                    reconstruction_preds = reconstruction_preds[(slice(None), *slicer_revert_padding[1:])]
+        if self.dataset_json['reconstruction']:
+            return predicted_logits, reconstruction_preds
+        else:
+            return predicted_logits
 
     def predict_from_files_sequential(self,
                            list_of_lists_or_source_folder: Union[str, List[List[str]]],

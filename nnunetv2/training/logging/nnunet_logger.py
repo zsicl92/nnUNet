@@ -14,7 +14,7 @@ class nnUNetLogger(object):
 
     YOU MUST LOG EXACTLY ONE VALUE PER EPOCH FOR EACH OF THE LOGGING ITEMS! DONT FUCK IT UP
     """
-    def __init__(self, verbose: bool = False):
+    def __init__(self, verbose: bool = False, reconstruction: bool = False):
         self.my_fantastic_logging = {
             'mean_fg_dice': list(),
             'ema_fg_dice': list(),
@@ -26,6 +26,17 @@ class nnUNetLogger(object):
             'epoch_end_timestamps': list()
         }
         self.verbose = verbose
+        self.reconstruction = reconstruction
+        self.my_fantastic_logging.update({'train_seg_losses': list(),
+                                        'train_recon_losses': list(),
+                                        'val_seg_losses': list(),
+                                        'val_recon_losses': list(),
+                                        'ema_union': list(),
+                                        'ema_ssim': list(),
+                                        'ema_psnr': list(),
+                                        'mean_ssim': list(),
+                                        'mean_psnr': list(),
+                                        'mean_union': list()})
         # shut up, this logging is great
 
     def log(self, key, value, epoch: int):
@@ -46,10 +57,12 @@ class nnUNetLogger(object):
             self.my_fantastic_logging[key][epoch] = value
 
         # handle the ema_fg_dice special case! It is automatically logged when we add a new mean_fg_dice
-        if key == 'mean_fg_dice':
-            new_ema_pseudo_dice = self.my_fantastic_logging['ema_fg_dice'][epoch - 1] * 0.9 + 0.1 * value \
-                if len(self.my_fantastic_logging['ema_fg_dice']) > 0 else value
-            self.log('ema_fg_dice', new_ema_pseudo_dice, epoch)
+        ema_keys = ['mean_fg_dice', 'mean_psnr', 'mean_ssim', 'mean_union']
+        if key in ema_keys:
+            ema_key = key.replace('mean', 'ema')
+            new_ema_val = self.my_fantastic_logging[ema_key][epoch - 1] * 0.9 + 0.1 * value \
+                if len(self.my_fantastic_logging[ema_key]) > 0 else value
+            self.log(ema_key, new_ema_val, epoch)
 
     def plot_progress_png(self, output_folder):
         # we infer the epoch form our internal logging
@@ -66,6 +79,17 @@ class nnUNetLogger(object):
                  linewidth=3)
         ax2.plot(x_values, self.my_fantastic_logging['ema_fg_dice'][:epoch + 1], color='g', ls='-', label="pseudo dice (mov. avg.)",
                  linewidth=4)
+        if self.reconstruction:
+            ax.plot(x_values, self.my_fantastic_logging['train_seg_losses'][:epoch + 1], color='m', ls='-', label="tr_seg", linewidth=4)
+            ax.plot(x_values, self.my_fantastic_logging['train_recon_losses'][:epoch + 1], color='k', ls='-', label="tr_rec", linewidth=4)
+            ax.plot(x_values, self.my_fantastic_logging['val_seg_losses'][:epoch + 1], color='y', ls='-', label="val_seg", linewidth=4)
+            ax.plot(x_values, self.my_fantastic_logging['val_recon_losses'][:epoch + 1], color='c', ls='-', label="val_rec", linewidth=4)
+            ax2.plot(x_values, self.my_fantastic_logging['ema_union'][:epoch + 1], color='r', ls='dotted', label="pseudo union",
+                    linewidth=3)
+            ax2.plot(x_values, self.my_fantastic_logging['ema_ssim'][:epoch + 1], color='m', ls='-', label="pseudo ssim",
+                    linewidth=4)
+            ax2.plot(x_values, self.my_fantastic_logging['ema_psnr'][:epoch + 1], color='k', ls='-', label="pseudo psnr",
+                    linewidth=4)
         ax.set_xlabel("epoch")
         ax.set_ylabel("loss")
         ax2.set_ylabel("pseudo dice")

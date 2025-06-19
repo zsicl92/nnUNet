@@ -3,7 +3,58 @@ from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLos
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
+import torch.nn.functional as F
 
+def ssim3d(x, y, window_size=11, C1=1e-4, C2=9e-4):
+    pad = window_size // 2
+    mu_x = F.avg_pool3d(x, window_size, stride=1, padding=pad)
+    mu_y = F.avg_pool3d(y, window_size, stride=1, padding=pad)
+
+    mu_x2 = mu_x ** 2
+    mu_y2 = mu_y ** 2
+    mu_xy = mu_x * mu_y
+
+    sigma_x2 = F.avg_pool3d(x * x, window_size, stride=1, padding=pad) - mu_x2
+    sigma_y2 = F.avg_pool3d(y * y, window_size, stride=1, padding=pad) - mu_y2
+    sigma_xy = F.avg_pool3d(x * y, window_size, stride=1, padding=pad) - mu_xy
+
+    ssim_n = (2 * mu_xy + C1) * (2 * sigma_xy + C2)
+    ssim_d = (mu_x2 + mu_y2 + C1) * (sigma_x2 + sigma_y2 + C2)
+    ssim = ssim_n / (ssim_d + 1e-8)
+    return torch.clamp((1 - ssim) / 2, 0, 1)  # SSIM loss in [0,1]
+
+class SSIM_L1Loss(nn.Module):
+    def __init__(self, alpha=0.85, window_size=11, weights=None):
+        """
+        alpha: weighted coefficients of SSIM and L1 loss
+        weights: optional, list [float], representing the loss weight of each layer
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.window_size = window_size
+        self.weights = weights  # None represents uniform average
+
+    def forward(self, pred, target):
+        if isinstance(pred, torch.Tensor):
+            pred = [pred]
+        if isinstance(target, torch.Tensor):
+            target = [target]
+
+        assert len(pred) == len(target), "Mismatch in number of outputs"
+
+        num_outputs = len(pred)
+        weights = self.weights or [1.0] * num_outputs
+        weights = torch.tensor(weights, dtype=pred[0].dtype, device=pred[0].device)
+        weights = weights / weights.sum()  # Normalized weights
+
+        total_loss = 0.0
+        for i, (p, t) in enumerate(zip(pred, target)):
+            l1 = F.l1_loss(p, t)
+            ssim = ssim3d(p, t, window_size=self.window_size).mean()
+            loss = self.alpha * ssim + (1 - self.alpha) * l1
+            total_loss += weights[i] * loss
+
+        return total_loss
 
 class DC_and_CE_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,

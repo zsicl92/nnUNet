@@ -15,6 +15,7 @@ from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
 # the Evaluator class of the previous nnU-Net was great and all but man was it overengineered. Keep it simple
 from nnunetv2.utilities.json_export import recursive_fix_for_json_export
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
+from nnunetv2.training.loss.dice import ssim_tensor_safe, psnr_tensor_flexible
 
 
 def label_or_region_to_key(label_or_region: Union[int, Tuple[int]]):
@@ -88,14 +89,27 @@ def compute_tp_fp_fn_tn(mask_ref: np.ndarray, mask_pred: np.ndarray, ignore_mask
 
 def compute_metrics(reference_file: str, prediction_file: str, image_reader_writer: BaseReaderWriter,
                     labels_or_regions: Union[List[int], List[Union[int, Tuple[int, ...]]]],
-                    ignore_label: int = None) -> dict:
+                    ignore_label: int = None, recon_ref = None, recon_pred = None, intensity_prop = None,
+                    dataset_json=None) -> dict:
     # load images
     seg_ref, seg_ref_dict = image_reader_writer.read_seg(reference_file)
     seg_pred, seg_pred_dict = image_reader_writer.read_seg(prediction_file)
+    results = {}
+    if recon_ref and recon_pred:
+        rec_ref, rec_ref_dict = image_reader_writer.read_seg(recon_ref)
+        rec_pred, rec_pred_dict = image_reader_writer.read_seg(recon_pred)
+        rec_ref, rec_pred = rec_ref[None], rec_pred[None] # add batch_size dim
+        lower_bound = intensity_prop['percentile_00_5']
+        upper_bound = intensity_prop['percentile_99_5']
+        rec_ref = rec_ref.astype(np.float32, copy=False)
+        np.clip(rec_ref, lower_bound, upper_bound, out=rec_ref)
+        ssim_score = ssim_tensor_safe(rec_pred, rec_ref)
+        results['recon_reference_file'] = recon_ref
+        results['recon_prediction_file'] = recon_pred
+        results['ssim_score'] = float(ssim_score.item())
 
     ignore_mask = seg_ref == ignore_label if ignore_label is not None else None
 
-    results = {}
     results['reference_file'] = reference_file
     results['prediction_file'] = prediction_file
     results['metrics'] = {}
@@ -125,7 +139,10 @@ def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: st
                               regions_or_labels: Union[List[int], List[Union[int, Tuple[int, ...]]]],
                               ignore_label: int = None,
                               num_processes: int = default_num_processes,
-                              chill: bool = True) -> dict:
+                              chill: bool = True,
+                              dataset_json=None,
+                              intensity_properties=None,
+                              folder_recon_ref=None) -> dict:
     """
     output_file must end with .json; can be None
     """
@@ -133,18 +150,29 @@ def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: st
         assert output_file.endswith('.json'), 'output_file should end with .json'
     files_pred = subfiles(folder_pred, suffix=file_ending, join=False)
     files_ref = subfiles(folder_ref, suffix=file_ending, join=False)
+    if dataset_json['reconstruction']:
+        file_recon_preds = subfiles(folder_pred, suffix='_hd'+file_ending, join=False)
+        file_recon_refs = subfiles(folder_recon_ref, suffix='_hd'+file_ending, join=False)
     if not chill:
         present = [isfile(join(folder_pred, i)) for i in files_ref]
         assert all(present), "Not all files in folder_ref exist in folder_pred"
     files_ref = [join(folder_ref, i) for i in files_pred]
     files_pred = [join(folder_pred, i) for i in files_pred]
+    if dataset_json['reconstruction']:
+        file_recon_preds = [join(folder_pred, i) for i in file_recon_preds]
+        file_recon_refs = [join(folder_recon_ref, i) for i in file_recon_preds]
+    else:
+        file_recon_preds = [None for i in files_pred]
+        file_recon_refs = [None for i in files_pred]
     with multiprocessing.get_context("spawn").Pool(num_processes) as pool:
         # for i in list(zip(files_ref, files_pred, [image_reader_writer] * len(files_pred), [regions_or_labels] * len(files_pred), [ignore_label] * len(files_pred))):
         #     compute_metrics(*i)
         results = pool.starmap(
             compute_metrics,
-            list(zip(files_ref, files_pred, [image_reader_writer] * len(files_pred), [regions_or_labels] * len(files_pred),
-                     [ignore_label] * len(files_pred)))
+            list(zip(files_ref, files_pred, [image_reader_writer] * len(files_pred), 
+                     [regions_or_labels] * len(files_pred),
+                     [ignore_label] * len(files_pred), file_recon_refs, file_recon_preds, 
+                     [intensity_properties] * len(files_pred), [dataset_json] * len(files_pred)))
         )
 
     # mean metric per class
@@ -168,7 +196,13 @@ def compute_metrics_on_folder(folder_ref: str, folder_pred: str, output_file: st
     [recursive_fix_for_json_export(i) for i in results]
     recursive_fix_for_json_export(means)
     recursive_fix_for_json_export(foreground_mean)
-    result = {'metric_per_case': results, 'mean': means, 'foreground_mean': foreground_mean}
+    if dataset_json['reconstruction']:
+        ssim_scores = [i['ssim_score'] for i in results]
+        mean_ssim = float(np.mean(np.array(ssim_scores)))
+        result = {'metric_per_case': results, 'mean': means, 'foreground_mean': foreground_mean, 
+                  'ssim_per_case': ssim_scores, 'mean_ssim': mean_ssim}
+    else:
+        result = {'metric_per_case': results, 'mean': means, 'foreground_mean': foreground_mean}
     if output_file is not None:
         save_summary_json(result, output_file)
     return result
