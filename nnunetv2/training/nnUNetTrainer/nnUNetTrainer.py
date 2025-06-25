@@ -1116,17 +1116,17 @@ class nnUNetTrainer(object):
                 l = self.loss(output, target)
 
         # we only need the output with the highest output resolution (if DS enabled)
-        if self.enable_deep_supervision:
-            output = output[0][0] if self.dataset_json['reconstruction'] else output[0]
-            target = target[0]
-            if self.dataset_json['reconstruction']:
-                recon_pred = output[1][0]
-                recon = recon[0]
         if self.dataset_json['reconstruction']:
-            recon_pred = output[1]
+            output, recon_pred = output
+        if self.enable_deep_supervision:
+            target = target[0]
+            output = output[0]
+            recon_pred = recon_pred[0]
+        if self.dataset_json['reconstruction']:
             CT_properties = self.plans_manager.foreground_intensity_properties_per_channel['0'] # 0: CT
             recon_pred = self.denormalize(recon_pred, CT_properties)
             recon = self.denormalize(recon, CT_properties)
+            recon_pred = recon_pred.to(recon.dtype)
             ssim_score = ssim_tensor_safe(recon_pred, recon)
             psnr_score = psnr_tensor_flexible(recon_pred, recon)
 
