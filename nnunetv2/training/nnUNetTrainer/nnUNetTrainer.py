@@ -231,7 +231,7 @@ class nnUNetTrainer(object):
             self.loss = self._build_loss()
             if self.dataset_json['reconstruction']:
                 self.recon_loss = SSIM_L1Loss(self.dataset_json['ssim_alpha'], 11, 
-                                              weights=self._get_deep_supervision_scales())
+                                              weights=np.array(self._get_deep_supervision_scales())[:, 0].tolist())
             # torch 2.2.2 crashes upon compiling CE loss
             # if self._do_i_compile():
             #     self.loss = torch.compile(self.loss)
@@ -677,13 +677,15 @@ class nnUNetTrainer(object):
                                        self.configuration_manager.patch_size,
                                        self.label_manager,
                                        oversample_foreground_percent=self.oversample_foreground_percent,
-                                       sampling_probabilities=None, pad_sides=None, transforms=tr_transforms)
+                                       sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+                                       reconstruction=self.dataset_json['reconstruction'])
             dl_val = nnUNetDataLoader3D(dataset_val, self.batch_size,
                                         self.configuration_manager.patch_size,
                                         self.configuration_manager.patch_size,
                                         self.label_manager,
                                         oversample_foreground_percent=self.oversample_foreground_percent,
-                                        sampling_probabilities=None, pad_sides=None, transforms=val_transforms)
+                                        sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+                                        reconstruction=self.dataset_json['reconstruction'])
 
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:

@@ -38,7 +38,7 @@ class SSIM_L1Loss(nn.Module):
         if isinstance(pred, torch.Tensor):
             pred = [pred]
         if isinstance(target, torch.Tensor):
-            target = [target]
+            target = [target] * len(pred)
 
         assert len(pred) == len(target), "Mismatch in number of outputs"
 
