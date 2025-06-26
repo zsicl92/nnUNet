@@ -219,7 +219,7 @@ def ssim_tensor_safe(pred: Union[torch.Tensor, List[torch.Tensor]],
         layer_wise_weights = [1.0 / len(pred)] * len(pred)
     else:
         assert len(layer_wise_weights) == len(pred), "Mismatch with number of prediction layers"
-        layer_wise_weights = torch.tensor(layer_wise_weights, device=pred[0].device)
+        layer_wise_weights = torch.tensor(layer_wise_weights, device=pred[0].device, dtype=pred[0].dtype)
         layer_wise_weights = layer_wise_weights / layer_wise_weights.sum()  # normalize
 
     ssim_all = []
@@ -230,7 +230,7 @@ def ssim_tensor_safe(pred: Union[torch.Tensor, List[torch.Tensor]],
         conv = F.conv2d if p.ndim == 4 else F.conv3d
 
         channel = p.size(1)
-        kernel = torch.ones(1, 1, *([window_size] * len(dims)), device=p.device)
+        kernel = torch.ones(1, 1, *([window_size] * len(dims)), device=p.device, dtype=p.dtype)
         kernel = kernel / kernel.numel()
         kernel = kernel.expand(channel, 1, *([-1] * len(dims)))
 

@@ -11,6 +11,7 @@ from typing import Tuple, Union, List
 
 import numpy as np
 import torch
+import torch.profiler
 from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
 from batchgenerators.dataloading.nondet_multi_threaded_augmenter import NonDetMultiThreadedAugmenter
 from batchgenerators.dataloading.single_threaded_augmenter import SingleThreadedAugmenter
@@ -1127,8 +1128,8 @@ class nnUNetTrainer(object):
             recon_pred = self.denormalize(recon_pred, CT_properties)
             recon = self.denormalize(recon, CT_properties)
             recon_pred = recon_pred.to(recon.dtype)
-            ssim_score = ssim_tensor_safe(recon_pred, recon)
-            psnr_score = psnr_tensor_flexible(recon_pred, recon)
+            ssim_score = ssim_tensor_safe(recon_pred, recon, ddp=self.is_ddp)
+            psnr_score = psnr_tensor_flexible(recon_pred, recon, ddp=self.is_ddp)
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -1513,20 +1514,49 @@ class nnUNetTrainer(object):
         self.on_train_start()
 
         for epoch in range(self.current_epoch, self.num_epochs):
+            # oes = time()
             self.on_epoch_start()
+            # oee = time()
+            # print(f'on_epoch_start time: {oee-oes}')
 
             self.on_train_epoch_start()
+            # oest = time()
+            # print(f'on_train_epoch_start time: {oest-oee}')
+
             train_outputs = []
             for batch_id in range(self.num_iterations_per_epoch):
-                train_outputs.append(self.train_step(next(self.dataloader_train)))
+                # s_tr = time()
+                batch_input = next(self.dataloader_train)
+                # e_tr = time()
+                # print(f'train dataloader time: {e_tr-s_tr}')
+                train_output = self.train_step(batch_input)
+                # e_trs = time()
+                # print(f'train step time: {e_trs-e_tr}')
+                train_outputs.append(train_output)
+            # s_tro = time()
             self.on_train_epoch_end(train_outputs)
+            # e_tro = time()
+            # print(f'on_train_epoch_end time: {e_tro-s_tro}')
 
             with torch.no_grad():
+                # v_s = time()
                 self.on_validation_epoch_start()
+                # v_e = time()
+                # print(f'on_validation_epoch_start time: {v_e-v_s}')
                 val_outputs = []
                 for batch_id in range(self.num_val_iterations_per_epoch):
-                    val_outputs.append(self.validation_step(next(self.dataloader_val)))
+                    # v_ls = time()
+                    batch_val_input = next(self.dataloader_val)
+                    # v_le = time()
+                    # print(f'on_validation_dataloader time: {v_le-v_ls}')
+                    val_output = self.validation_step(batch_val_input)
+                    # v_vse = time()
+                    # print(f'on_validation_step time: {v_vse-v_le}')
+                    val_outputs.append(val_output)
+                # v_ves = time()
                 self.on_validation_epoch_end(val_outputs)
+                # v_vee = time()
+                # print(f'on_validation_epoch_end time: {v_vee-v_ves}')
 
             self.on_epoch_end()
 

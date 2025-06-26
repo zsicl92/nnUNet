@@ -38,7 +38,13 @@ class SSIM_L1Loss(nn.Module):
         if isinstance(pred, torch.Tensor):
             pred = [pred]
         if isinstance(target, torch.Tensor):
-            target = [target] * len(pred)
+            target = [target]
+            if len(target) != len(pred):
+                for ii, item in enumerate(pred):
+                    if ii == 1:
+                        target.append(target[-1])
+                    if ii > 1:
+                        target.append(F.interpolate(target[-1], size=item.shape[2:], mode='trilinear', align_corners=True))
 
         assert len(pred) == len(target), "Mismatch in number of outputs"
 
