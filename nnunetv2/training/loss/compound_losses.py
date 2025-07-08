@@ -55,7 +55,8 @@ class SSIM_L1Loss(nn.Module):
 
         total_loss = 0.0
         for i, (p, t) in enumerate(zip(pred, target)):
-            l1 = F.l1_loss(p, t)
+            # l1 = F.l1_loss(p, t)
+            l1 = F.smooth_l1_loss(p, t, beta=1.0, reduction='mean')
             ssim = ssim3d(p, t, window_size=self.window_size).mean()
             loss = self.alpha * ssim + (1 - self.alpha) * l1
             total_loss += weights[i] * loss
