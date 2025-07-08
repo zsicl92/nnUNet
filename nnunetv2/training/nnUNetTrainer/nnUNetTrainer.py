@@ -151,7 +151,7 @@ class nnUNetTrainer(object):
         self.oversample_foreground_percent = 0.33
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 1100
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
@@ -990,6 +990,8 @@ class nnUNetTrainer(object):
         data = batch['data']
         target = batch['target']
         recon = batch['recon']
+        
+        
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1000,7 +1002,8 @@ class nnUNetTrainer(object):
             recon = [i.to(self.device, non_blocking=True) for i in recon]
         else:
             recon = recon.to(self.device, non_blocking=True)
-
+        #print(data.max(), data.min(), data.mean(), data.std())
+        #print(target.max(), target.min(), target.mean(), target.std())
         self.optimizer.zero_grad(set_to_none=True)
         # Autocast can be annoying
         # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
@@ -1125,11 +1128,44 @@ class nnUNetTrainer(object):
             recon_pred = recon_pred[0]
         if self.dataset_json['reconstruction']:
             CT_properties = self.plans_manager.foreground_intensity_properties_per_channel['0'] # 0: CT
+            
             recon_pred = self.denormalize(recon_pred, CT_properties)
+            # print(recon_pred.shape)
+            # print(recon.shape)
+            # print(CT_properties)
+            # # Select middle slice (index 96) from first sample in batch
+            # slice_idx = 30  # Middle of 192 slices
+            # slice_pred = recon_pred[0, 0,:,:, slice_idx]  # Shape: [192, 192]
+            # slice_gt = recon[0, 0, :,:, slice_idx]  # Shape: [192, 192]
+
+            # # Convert slices to numpy arrays
+            # slice_pred_np = slice_pred.detach().cpu().numpy()
+            # slice_gt_np = slice_gt.detach().cpu().numpy()
+
+            # # Normalize to [0, 255] and convert to uint8
+            # def normalize_to_uint8(arr):
+            #     arr_min = arr.min()
+            #     arr_max = arr.max()
+            #     if arr_max - arr_min > 1e-8:  # Avoid division by zero
+            #         arr = (arr - arr_min) / (arr_max - arr_min) * 255
+            #     return arr.astype(np.uint8)
+
+            # slice_pred_uint8 = normalize_to_uint8(slice_pred_np)
+            # slice_gt_uint8 = normalize_to_uint8(slice_gt_np)
+
+            # # Save using PIL
+            # from PIL import Image
+            # Image.fromarray(slice_pred_uint8).save('recon_pred_slice.png')
+            # Image.fromarray(slice_gt_uint8).save('recon_gt_slice.png')
+            #####
+            
             recon = self.denormalize(recon, CT_properties)
             recon_pred = recon_pred.to(recon.dtype)
-            ssim_score = ssim_tensor_safe(recon_pred, recon, ddp=self.is_ddp)
-            psnr_score = psnr_tensor_flexible(recon_pred, recon, ddp=self.is_ddp)
+            
+            
+            ssim_score = ssim_tensor_safe(recon_pred, recon, data_range=4096, ddp=self.is_ddp)
+            psnr_score = psnr_tensor_flexible(recon_pred, recon, data_range=4096, ddp=self.is_ddp)
+            print(f"ssim_score: {ssim_score}, psnr_score: {psnr_score}")
 
         # the following is needed for online evaluation. Fake dice (green line)
         axes = [0] + list(range(2, output.ndim))
@@ -1476,7 +1512,7 @@ class nnUNetTrainer(object):
                         ))
                 # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
                 if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
-                    dist.barrier()
+                    dist.barrier() 
 
             _ = [r.get() for r in results]
 
@@ -1512,8 +1548,9 @@ class nnUNetTrainer(object):
 
     def run_training(self):
         self.on_train_start()
-
+        #self.current_epoch = 500
         for epoch in range(self.current_epoch, self.num_epochs):
+           
             # oes = time()
             self.on_epoch_start()
             # oee = time()
@@ -1524,7 +1561,10 @@ class nnUNetTrainer(object):
             # print(f'on_train_epoch_start time: {oest-oee}')
 
             train_outputs = []
+            #break
+            #self.num_iterations_per_epoch =1 
             for batch_id in range(self.num_iterations_per_epoch):
+               
                 # s_tr = time()
                 batch_input = next(self.dataloader_train)
                 # e_tr = time()
@@ -1533,6 +1573,8 @@ class nnUNetTrainer(object):
                 # e_trs = time()
                 # print(f'train step time: {e_trs-e_tr}')
                 train_outputs.append(train_output)
+                #break
+                
             # s_tro = time()
             self.on_train_epoch_end(train_outputs)
             # e_tro = time()
@@ -1544,6 +1586,7 @@ class nnUNetTrainer(object):
                 # v_e = time()
                 # print(f'on_validation_epoch_start time: {v_e-v_s}')
                 val_outputs = []
+                
                 for batch_id in range(self.num_val_iterations_per_epoch):
                     # v_ls = time()
                     batch_val_input = next(self.dataloader_val)
@@ -1556,7 +1599,7 @@ class nnUNetTrainer(object):
                 # v_ves = time()
                 self.on_validation_epoch_end(val_outputs)
                 # v_vee = time()
-                # print(f'on_validation_epoch_end time: {v_vee-v_ves}')
+                #print(f'on_validation_epoch_end time: {v_vee-v_ves}')
 
             self.on_epoch_end()
 

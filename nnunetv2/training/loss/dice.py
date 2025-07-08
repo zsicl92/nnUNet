@@ -186,8 +186,9 @@ def get_tp_fp_fn_tn(net_output, gt, axes=None, mask=None, square=False):
 def ssim_tensor_safe(pred: Union[torch.Tensor, List[torch.Tensor]],
                      target: Union[torch.Tensor, List[torch.Tensor]],
                      window_size=11,
-                     C1=0.01**2,
-                     C2=0.03**2,
+                     data_range = 4096,
+                     K1=0.01,
+                     K2=0.03,
                      eps=1e-8,
                      reduction='mean',
                      ddp: bool = False,
@@ -214,6 +215,8 @@ def ssim_tensor_safe(pred: Union[torch.Tensor, List[torch.Tensor]],
 
     assert isinstance(pred, list) and isinstance(target, list)
     assert len(pred) == len(target)
+    C1 = (K1*data_range) ** 2
+    C2 = (K2*data_range) ** 2
     
     if layer_wise_weights is None:
         layer_wise_weights = [1.0 / len(pred)] * len(pred)

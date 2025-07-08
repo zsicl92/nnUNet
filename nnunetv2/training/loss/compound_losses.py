@@ -5,7 +5,11 @@ from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
 import torch.nn.functional as F
 
-def ssim3d(x, y, window_size=11, C1=1e-4, C2=9e-4):
+def ssim3d(x, y, window_size=11, data_range=4096, K1=0.01, K2=0.03):
+
+    C1 = K1 / data_range ** 2
+    C2 = K2 / data_range ** 2
+
     pad = window_size // 2
     mu_x = F.avg_pool3d(x, window_size, stride=1, padding=pad)
     mu_y = F.avg_pool3d(y, window_size, stride=1, padding=pad)
@@ -52,11 +56,11 @@ class SSIM_L1Loss(nn.Module):
         weights = self.weights or [1.0] * num_outputs
         weights = torch.tensor(weights, dtype=pred[0].dtype, device=pred[0].device)
         weights = weights / weights.sum()  # Normalized weights
-
+        
         total_loss = 0.0
         for i, (p, t) in enumerate(zip(pred, target)):
             l1 = F.l1_loss(p, t)
-            ssim = ssim3d(p, t, window_size=self.window_size).mean()
+            ssim = ssim3d(p, t, data_range=10, window_size=self.window_size).mean()
             loss = self.alpha * ssim + (1 - self.alpha) * l1
             total_loss += weights[i] * loss
 
